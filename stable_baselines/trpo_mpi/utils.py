@@ -1,3 +1,7 @@
+'''Module that contains utilities for use by TRPO class.'''
+from collections import defaultdict
+from itertools import chain, count
+
 import gym
 import numpy as np
 
@@ -27,103 +31,91 @@ def traj_segment_generator(policy, env, horizon, reward_giver=None, gail=False):
         - ep_true_rets: (float) the real environment reward
     """
     # Check when using GAIL
-    assert not (gail and reward_giver is None), "You must pass a reward giver when using GAIL"
+    assert not (
+        gail and reward_giver is None), "You must pass a reward giver when using GAIL"
 
     # Initialize state variables
-    step = 0
-    action = env.action_space.sample()  # not used, just so we have the datatype
-    observation = env.reset()
+    obs_shape = env.observation_space.shape
+    # not used, just so we have the datatype
+    action = env.action_space.sample()
+    action = np.reshape(action, (-1, *env.action_space.shape))
+    observation = env.reset().reshape((-1, *obs_shape))
 
-    cur_ep_ret = 0  # return in current episode
+    # ep_ret  # return in current episode
+    # ep_true_ret # true return (Applies if GAIL)
+    # ep_len  # len of current episode
+    current = defaultdict(lambda: 0)
     current_it_len = 0  # len of current iteration
-    current_ep_len = 0 # len of current episode
-    cur_ep_true_ret = 0
-    ep_true_rets = []
-    ep_rets = []  # returns of completed episodes in this segment
-    ep_lens = []  # Episode lengths
+    # ep_rets  # returns of completed episodes in this segment
+    # ep_true_rets # true returns of completed episodes in this segment (GAIL)
+    # ep_lens  # Episode lengths
+    segments = defaultdict(list)
 
     # Initialize history arrays
-    observations = np.array([observation for _ in range(horizon)])
-    true_rews = np.zeros(horizon, 'float32')
-    rews = np.zeros(horizon, 'float32')
-    vpreds = np.zeros(horizon, 'float32')
-    dones = np.zeros(horizon, 'int32')
-    actions = np.array([action for _ in range(horizon)])
-    prev_actions = actions.copy()
+    data = defaultdict(list)
     states = policy.initial_state
     done = True  # marks if we're on first timestep of an episode
 
-    while True:
+    for step in count():
         prevac = action
-        action, vpred, states, _ = policy.step(observation.reshape(-1, *observation.shape), states, done)
+        action, vpred, states, _ = policy.step(observation, states, done)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if step > 0 and step % horizon == 0:
             yield {
-                    "ob": observations,
-                    "rew": rews,
-                    "dones": dones,
-                    "true_rew": true_rews,
-                    "vpred": vpreds,
-                    "ac": actions,
-                    "prevac": prev_actions,
-                    "nextvpred": vpred[0] * (1 - done),
-                    "ep_rets": ep_rets,
-                    "ep_lens": ep_lens,
-                    "ep_true_rets": ep_true_rets,
-                    "total_timestep": current_it_len
+                'total_timestep': current_it_len,
+                "nextvpred": vpred[0] * (1 - done),
+                **{k: np.array(d) for k, d in data.items()},
+                **segments
             }
-            _, vpred, _, _ = policy.step(observation.reshape(-1, *observation.shape))
-            # Be careful!!! if you change the downstream algorithm to aggregate
-            # several of these batches, then be sure to do a deepcopy
-            ep_rets = []
-            ep_true_rets = []
-            ep_lens = []
+            data.clear()
+            _, vpred, _, _ = policy.step(observation)
+            segments.clear()
             # Reset current iteration length
             current_it_len = 0
-        i = step % horizon
-        observations[i] = observation
-        vpreds[i] = vpred[0]
-        actions[i] = action[0]
-        prev_actions[i] = prevac
+        data['ob'].extend(observation)
+        data['vpred'].extend(vpred)
+        data['ac'].extend(action)
+        data['prevac'].extend(prevac)
 
         clipped_action = action
         # Clip the actions to avoid out of bound error
         if isinstance(env.action_space, gym.spaces.Box):
-            clipped_action = np.clip(action, env.action_space.low, env.action_space.high)
+            clipped_action = np.clip(
+                action, env.action_space.low, env.action_space.high)
 
+        observation, true_rew, done, _ = env.step(clipped_action)
+        observation = observation.reshape((-1, *obs_shape))
         if gail:
-            rew = reward_giver.get_reward(observation, clipped_action[0])
-            observation, true_rew, done, _info = env.step(clipped_action[0])
+            rew = [
+                reward_giver.get_reward(obs, act)
+                for obs, act in zip(observation, clipped_action)
+            ]
         else:
-            observation, rew, done, _info = env.step(clipped_action[0])
-            true_rew = rew
-        rews[i] = rew
-        true_rews[i] = true_rew
-        dones[i] = done
+            rew = true_rew
+        data['rew'].extend(rew)
+        data['true_rew'].extend(true_rew)
+        data['dones'].extend(done)
 
-        cur_ep_ret += rew
-        cur_ep_true_ret += true_rew
+        current['ep_rets'] += np.mean(rew)
+        current['ep_true_rets'] += np.mean(true_rew)
+        current['ep_lens'] += 1
         current_it_len += 1
-        current_ep_len += 1
-        if done:
-            ep_rets.append(cur_ep_ret)
-            ep_true_rets.append(cur_ep_true_ret)
-            ep_lens.append(current_ep_len)
-            cur_ep_ret = 0
-            cur_ep_true_ret = 0
-            current_ep_len = 0
+        if np.any(done):
+            for key in current:
+                segments[key].append(current[key])
+            current.clear()
             if not isinstance(env, VecEnv):
-                observation = env.reset()
-        step += 1
+                observation = env.reset().reshape((-1, *obs_shape))
 
 
 def add_vtarg_and_adv(seg, gamma, lam):
     """
     Compute target value using TD(lambda) estimator, and advantage with GAE(lambda)
 
-    :param seg: (dict) the current segment of the trajectory (see traj_segment_generator return for more information)
+    :param seg: (dict) the current segment of the trajectory
+    (see traj_segment_generator return for more information)
     :param gamma: (float) Discount factor
     :param lam: (float) GAE factor
     """
@@ -137,7 +129,8 @@ def add_vtarg_and_adv(seg, gamma, lam):
     for step in reversed(range(rew_len)):
         nonterminal = 1 - new[step + 1]
         delta = rew[step] + gamma * vpred[step + 1] * nonterminal - vpred[step]
-        gaelam[step] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        gaelam[step] = lastgaelam = delta + \
+            gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
 
@@ -148,4 +141,4 @@ def flatten_lists(listoflists):
     :param listoflists: (list(list))
     :return: (list)
     """
-    return [el for list_ in listoflists for el in list_]
+    return list(chain.from_iterable(listoflists))
